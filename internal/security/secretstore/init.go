@@ -145,6 +145,8 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 			sCode, _ := client.HealthCheck()
 
 			switch sCode {
+
+			////
 			case http.StatusOK:
 				// Load the init response from disk since we need it to regenerate root token later
 				if err := loadInitResponse(lc, fileOpener, secretStoreConfig, &initResponse); err != nil {
@@ -158,6 +160,7 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 				// we're done here. Will go into ready mode or reseal
 				shouldContinue = false
 
+			/// initialize here, if we iniitilize, then we also need to revoke root, then unseal
 			case http.StatusNotImplemented:
 				lc.Infof("vault is not initialized (status code: %d). Starting initialization and unseal phases", sCode)
 				initResponse, err = client.Init(secretStoreConfig.VaultSecretThreshold, secretStoreConfig.VaultSecretShares)
@@ -172,7 +175,6 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 					initResponse.RootToken = ""
 					lc.Info("Root token stripped from init response for security reasons")
 				}
-
 				err = client.Unseal(initResponse.KeysBase64)
 				if err != nil {
 					lc.Errorf("Unable to unseal Vault: %s", err.Error())
@@ -181,6 +183,7 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 
 				// We need the unencrypted initResponse in order to generate a temporary root token later
 				// Make a copy and save the copy, possibly encrypted
+
 				encryptedInitResponse := initResponse
 				// Optionally encrypt the vault init response based on whether encryption was enabled
 				if vmkEncryption.IsEncrypting() {
@@ -194,6 +197,7 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 					return true
 				}
 
+			/// does this mean initialized but not unsealed?
 			case http.StatusServiceUnavailable:
 				lc.Infof("vault is sealed (status code: %d). Starting unseal phase", sCode)
 				if err := loadInitResponse(lc, fileOpener, secretStoreConfig, &initResponse); err != nil {
@@ -209,6 +213,7 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 					}
 				}
 
+				//// unsealing
 				err := client.Unseal(initResponse.KeysBase64)
 				if err == nil {
 					shouldContinue = false
@@ -234,6 +239,18 @@ func (b *Bootstrap) BootstrapHandler(ctx context.Context, _ *sync.WaitGroup, _ s
 			time.Sleep(intervalDuration)
 		}
 	}
+
+	// //if
+	// if sCode, initResponse, err := vmInit.initializer(asdf); err != nil{
+	// 	return false
+	// }
+	// if sCode !=
+	if err := client.Unseal(initResponse.KeysBase64); err != nil {
+		lc.Errorf("Failed to unseal vault with error %s", err.Error())
+		return false
+	}
+	/// return (success, err)
+	// if not sucess and err != terminal failure condition, keep trying
 
 	/* After vault is initialized and unsealed, it takes a while to get ready to accept any request. During which period any request will get http 500 error.
 	We need to check the status constantly until it return http StatusOK.
