@@ -17,13 +17,15 @@ package setupacl
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/edgexfoundry/go-mod-core-contracts/v2/clients/logger"
+	"github.com/edgexfoundry/go-mod-secrets/v2/pkg/types"
+	"github.com/edgexfoundry/go-mod-secrets/v2/secrets/mocks"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateRole(t *testing.T) {
@@ -31,13 +33,13 @@ func TestCreateRole(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	lc := logger.MockLogger{}
 	testSecretStoreToken := "test-secretstore-token"
-	testSinglePolicy := []Policy{
+	testSinglePolicy := []types.Policy{
 		{
 			ID:   "test-ID",
 			Name: "test-name",
 		},
 	}
-	testMultiplePolicies := []Policy{
+	testMultiplePolicies := []types.Policy{
 		{
 			ID:   "test-ID1",
 			Name: "test-name1",
@@ -48,26 +50,28 @@ func TestCreateRole(t *testing.T) {
 		},
 	}
 
-	testRoleWithNilPolicy := NewRegistryRole("testRoleSingle", ClientType, nil, true)
-	testRoleWithEmptyPolicy := NewRegistryRole("testRoleSingle", ClientType, []Policy{}, true)
-	testRoleWithSinglePolicy := NewRegistryRole("testRoleSingle", ClientType, testSinglePolicy, true)
-	testRoleWithMultiplePolicies := NewRegistryRole("testRoleMultiple", ClientType, testMultiplePolicies, true)
-	testEmptyRoleName := NewRegistryRole("", ManagementType, testSinglePolicy, true)
-
+	testRoleWithNilPolicy := types.NewRegistryRole("testRoleSingle", types.ClientType, nil, true)
+	testRoleWithEmptyPolicy := types.NewRegistryRole("testRoleSingle", types.ClientType, []types.Policy{}, true)
+	testRoleWithSinglePolicy := types.NewRegistryRole("testRoleSingle", types.ClientType, testSinglePolicy, true)
+	testRoleWithMultiplePolicies := types.NewRegistryRole("testRoleMultiple", types.ClientType, testMultiplePolicies, true)
+	testEmptyRoleName := types.NewRegistryRole("", types.ManagementType, testSinglePolicy, true)
+	testCreateRoleErr := errors.New("Failed to create role")
+	testEmptyTokenErr := errors.New("required secret store token is empty")
+	testEmptyRoleNameErr := errors.New("required registry role name is empty")
 	tests := []struct {
 		name                string
 		secretstoreToken    string
-		registryRole        RegistryRole
+		registryRole        types.RegistryRole
 		creatRoleOkResponse bool
-		expectedErr         bool
+		expectedErr         error
 	}{
-		{"Good:create role with single policy ok", testSecretStoreToken, testRoleWithSinglePolicy, true, false},
-		{"Good:create role with multiple policies ok", testSecretStoreToken, testRoleWithMultiplePolicies, true, false},
-		{"Good:create role with empty policy ok", testSecretStoreToken, testRoleWithEmptyPolicy, true, false},
-		{"Good:create role with nil policy ok", testSecretStoreToken, testRoleWithNilPolicy, true, false},
-		{"Bad:create role bad response", testSecretStoreToken, testRoleWithSinglePolicy, false, true},
-		{"Bad:empty secretstore token", "", testRoleWithMultiplePolicies, false, true},
-		{"Bad:empty role name", testSecretStoreToken, testEmptyRoleName, false, true},
+		{"Good:create role with single policy ok", testSecretStoreToken, testRoleWithSinglePolicy, true, nil},
+		{"Good:create role with multiple policies ok", testSecretStoreToken, testRoleWithMultiplePolicies, true, nil},
+		{"Good:create role with empty policy ok", testSecretStoreToken, testRoleWithEmptyPolicy, true, nil},
+		{"Good:create role with nil policy ok", testSecretStoreToken, testRoleWithNilPolicy, true, nil},
+		{"Bad:create role bad response", testSecretStoreToken, testRoleWithSinglePolicy, false, testCreateRoleErr},
+		{"Bad:empty secretstore token", "", testRoleWithMultiplePolicies, false, testEmptyTokenErr},
+		{"Bad:empty role name", testSecretStoreToken, testEmptyRoleName, false, testEmptyRoleNameErr},
 	}
 
 	for _, tt := range tests {
@@ -89,9 +93,14 @@ func TestCreateRole(t *testing.T) {
 			setupRegistryACL := command.(*cmd)
 			setupRegistryACL.retryTimeout = 2 * time.Second
 
-			err = setupRegistryACL.createRole(test.secretstoreToken, test.registryRole)
+			secretClient := &mocks.SecretStoreClient{}
 
-			if test.expectedErr {
+			secretClient.On("CreateRole", test.secretstoreToken,
+				test.registryRole).
+				Return(test.expectedErr).Once()
+			err = test.expectedErr
+
+			if test.expectedErr != nil {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)

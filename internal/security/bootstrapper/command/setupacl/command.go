@@ -16,6 +16,7 @@
 package setupacl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,7 @@ import (
 	"github.com/edgexfoundry/go-mod-secrets/v2/secrets"
 
 	"github.com/edgexfoundry/go-mod-core-contracts/v2/clients/logger"
+	"github.com/edgexfoundry/go-mod-core-contracts/v2/common"
 )
 
 const (
@@ -71,7 +73,7 @@ type cmd struct {
 
 	// internal state
 	retryTimeout           time.Duration
-	bootstrapACLTokenCache *BootStrapACLTokenInfo
+	bootstrapACLTokenCache *types.BootStrapACLTokenInfo
 	secretstoreTokenCache  string
 }
 
@@ -152,8 +154,9 @@ func (c *cmd) Execute() (statusCode int, err error) {
 	if err != nil {
 		return interfaces.StatusCodeExitWithError, fmt.Errorf("failed to create SecretStoreClient: %s", err.Error())
 	}
-	// configure Consul access with both Secret Store token and consul's bootstrap acl token
-	if err := client.configureConsulAccess(secretstoreToken, bootstrapACLToken.SecretID); err != nil {
+	//configure Consul access with both Secret Store token and consul's bootstrap acl token
+	if err := client.ConfigureConsulAccess(secretstoreToken, bootstrapACLToken.SecretID,
+		c.configuration.StageGate.Registry.Host, c.configuration.StageGate.Registry.Port); err != nil {
 		return interfaces.StatusCodeExitWithError, fmt.Errorf("failed to configure Consul access: %v", err)
 	}
 
@@ -250,7 +253,7 @@ func (c *cmd) reSetupEdgeXACLTokenRoles() error {
 	return nil
 }
 
-func (c *cmd) createBootstrapACLToken() (*BootStrapACLTokenInfo, error) {
+func (c *cmd) createBootstrapACLToken() (*types.BootStrapACLTokenInfo, error) {
 	bootstrapACLToken, err := c.generateBootStrapACLToken()
 	if err != nil {
 		// although we have a leader, but it is a very very rare chance that we could hit an error on legacy mode
@@ -276,7 +279,7 @@ func (c *cmd) createBootstrapACLToken() (*BootStrapACLTokenInfo, error) {
 	return bootstrapACLToken, nil
 }
 
-func (c *cmd) saveACLTokens(bootstrapACLToken *BootStrapACLTokenInfo) error {
+func (c *cmd) saveACLTokens(bootstrapACLToken *types.BootStrapACLTokenInfo) error {
 	// Save the bootstrap ACL token into json file so that it can be used later on
 	if err := c.saveBootstrapACLToken(bootstrapACLToken); err != nil {
 		return fmt.Errorf("failed to save registry's bootstrap ACL token: %v", err)
@@ -288,7 +291,7 @@ func (c *cmd) saveACLTokens(bootstrapACLToken *BootStrapACLTokenInfo) error {
 	return nil
 }
 
-func (c *cmd) createAndSaveManagementACLToken(bootstrapACLToken *BootStrapACLTokenInfo) error {
+func (c *cmd) createAndSaveManagementACLToken(bootstrapACLToken *types.BootStrapACLTokenInfo) error {
 	// create and save management token into json file in order to use later
 	managementACLTokenInfo, err := c.createManagementToken(*bootstrapACLToken)
 	if err != nil {
@@ -339,12 +342,11 @@ func (c *cmd) createEdgeXACLTokenRoles(bootstrapACLTokenID, secretstoreToken str
 		}
 
 		// create roles based on the service keys as the role names
-		edgexACLTokenRole := NewRegistryRole(roleName, ClientType, []Policy{
+		edgexACLTokenRole := types.NewRegistryRole(roleName, types.ClientType, []types.Policy{
 			*edgexServicePolicy,
 			// localUse set to false as some EdgeX services may be running in a different node
 		}, false)
 
-		// fail all if any one of the role creation failed
 		clientConfig := types.SecretConfig{
 			Type:     secrets.Vault,
 			Host:     c.configuration.SecretStore.Host,
@@ -355,12 +357,72 @@ func (c *cmd) createEdgeXACLTokenRoles(bootstrapACLTokenID, secretstoreToken str
 		if err != nil {
 			return fmt.Errorf("failed to create SecretStoreClient: %s", err.Error())
 		}
-		if err := client.createRole(secretstoreToken, edgexACLTokenRole); err != nil {
+
+		if err := client.CreateRole(secretstoreToken, edgexACLTokenRole); err != nil {
 			return fmt.Errorf("failed to create edgex role: %v", err)
 		}
 	}
 
 	return nil
+}
+
+// configureConsulAccess is to enable the Consul config access to the SecretStore via consul/config/access API
+// see the reference: https://www.vaultproject.io/api-docs/secret/consul#configure-access
+func (c *cmd) configureConsulAccess(secretStoreToken string, bootstrapACLToken string) error {
+	configAccessURL := fmt.Sprintf("%s://%s:%d%s", c.configuration.SecretStore.Protocol,
+		c.configuration.SecretStore.Host, c.configuration.SecretStore.Port, consulConfigAccessVaultAPI)
+	_, err := url.Parse(configAccessURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse config Access URL: %v", err)
+	}
+
+	c.loggingClient.Debugf("configAccessURL: %s", configAccessURL)
+
+	type ConfigAccess struct {
+		RegistryAddress   string `json:"address"`
+		BootstrapACLToken string `json:"token"`
+	}
+
+	payload := &ConfigAccess{
+		RegistryAddress:   fmt.Sprintf("%s:%d", c.configuration.StageGate.Registry.Host, c.configuration.StageGate.Registry.Port),
+		BootstrapACLToken: bootstrapACLToken,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	c.loggingClient.Tracef("payload: %v", payload)
+	if err != nil {
+		return fmt.Errorf("Failed to marshal JSON string payload: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, configAccessURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("Failed to prepare POST request for http URL: %w", err)
+	}
+
+	req.Header.Add("X-Vault-Token", secretStoreToken)
+	req.Header.Add(common.ContentType, common.ContentTypeJSON)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Failed to send request for http URL: %w", err)
+	}
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		// no response body returned in this case
+		c.loggingClient.Info("successfully configure Consul access for secretstore")
+		return nil
+	default:
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			c.loggingClient.Errorf("cannot read resp.Body: %v", err)
+		}
+		return fmt.Errorf("failed to configure Consul access for secretstore via URL [%s] and status code= %d: %s",
+			configAccessURL, resp.StatusCode, string(body))
+	}
 }
 
 // getKeyPrefix get the consul ACL key prefix for the service with the input roleName, ie. the service key-based
@@ -470,7 +532,7 @@ func getUniqueRolesFromEnv() (map[string]struct{}, error) {
 
 // setupAgentToken is to set up the agent token using the inputToken to the running agent if haven't set up yet
 // if the inputToken is nil then it will try to reconstruct from the saved file
-func (c *cmd) setupAgentToken(inputToken *BootStrapACLTokenInfo) error {
+func (c *cmd) setupAgentToken(inputToken *types.BootStrapACLTokenInfo) error {
 	var err error
 	setupAlreadyPrevious := false
 	bootstrapACLToken := inputToken
@@ -512,7 +574,7 @@ func (c *cmd) setupAgentToken(inputToken *BootStrapACLTokenInfo) error {
 }
 
 // reconstructBootstrapACLToken reads bootstrap ACL token from the saved file and reconstruct it into BootStrapACLTokenInfo
-func (c *cmd) reconstructBootstrapACLToken() (*BootStrapACLTokenInfo, error) {
+func (c *cmd) reconstructBootstrapACLToken() (*types.BootStrapACLTokenInfo, error) {
 	if c.bootstrapACLTokenCache != nil {
 		// re-use the cached one
 		return c.bootstrapACLTokenCache, nil
@@ -539,7 +601,7 @@ func (c *cmd) reconstructBootstrapACLToken() (*BootStrapACLTokenInfo, error) {
 		return nil, fmt.Errorf("failed to open file reader: %v", err)
 	}
 
-	var bootstrapACLToken BootStrapACLTokenInfo
+	var bootstrapACLToken types.BootStrapACLTokenInfo
 	if err := json.NewDecoder(tokenReader).Decode(&bootstrapACLToken); err != nil {
 		return nil, fmt.Errorf("failed to parse token data into BootStrapACLTokenInfo: %v", err)
 	}
@@ -668,65 +730,6 @@ func (c *cmd) retrieveSecretStoreTokenFromFile() (string, error) {
 
 	return secretStoreToken, nil
 }
-
-// configureConsulAccess is to enable the Consul config access to the SecretStore via consul/config/access API
-// see the reference: https://www.vaultproject.io/api-docs/secret/consul#configure-access
-// func (c *cmd) configureConsulAccess(secretStoreToken string, bootstrapACLToken string) error {
-// 	configAccessURL := fmt.Sprintf("%s://%s:%d%s", c.configuration.SecretStore.Protocol,
-// 		c.configuration.SecretStore.Host, c.configuration.SecretStore.Port, consulConfigAccessVaultAPI)
-// 	_, err := url.Parse(configAccessURL)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to parse config Access URL: %v", err)
-// 	}
-
-// 	c.loggingClient.Debugf("configAccessURL: %s", configAccessURL)
-
-// 	type ConfigAccess struct {
-// 		RegistryAddress   string `json:"address"`
-// 		BootstrapACLToken string `json:"token"`
-// 	}
-
-// 	payload := &ConfigAccess{
-// 		RegistryAddress:   fmt.Sprintf("%s:%d", c.configuration.StageGate.Registry.Host, c.configuration.StageGate.Registry.Port),
-// 		BootstrapACLToken: bootstrapACLToken,
-// 	}
-
-// 	jsonPayload, err := json.Marshal(payload)
-// 	c.loggingClient.Tracef("payload: %v", payload)
-// 	if err != nil {
-// 		return fmt.Errorf("Failed to marshal JSON string payload: %v", err)
-// 	}
-
-// 	req, err := http.NewRequest(http.MethodPost, configAccessURL, bytes.NewBuffer(jsonPayload))
-// 	if err != nil {
-// 		return fmt.Errorf("Failed to prepare POST request for http URL: %w", err)
-// 	}
-
-// 	req.Header.Add("X-Vault-Token", secretStoreToken)
-// 	req.Header.Add(common.ContentType, common.ContentTypeJSON)
-// 	resp, err := c.client.Do(req)
-// 	if err != nil {
-// 		return fmt.Errorf("Failed to send request for http URL: %w", err)
-// 	}
-
-// 	defer func() {
-// 		_ = resp.Body.Close()
-// 	}()
-
-// 	switch resp.StatusCode {
-// 	case http.StatusNoContent:
-// 		// no response body returned in this case
-// 		c.loggingClient.Info("successfully configure Consul access for secretstore")
-// 		return nil
-// 	default:
-// 		body, err := io.ReadAll(resp.Body)
-// 		if err != nil {
-// 			c.loggingClient.Errorf("cannot read resp.Body: %v", err)
-// 		}
-// 		return fmt.Errorf("failed to configure Consul access for secretstore via URL [%s] and status code= %d: %s",
-// 			configAccessURL, resp.StatusCode, string(body))
-// 	}
-// }
 
 func (c *cmd) writeSentinelFile() error {
 	absPath, err := filepath.Abs(c.configuration.StageGate.Registry.ACL.SentinelFilePath)
